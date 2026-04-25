@@ -20,6 +20,7 @@ from sglang.srt.layers.quantization.quark.schemes import (
     QuarkMoEScheme,
     QuarkW4A4MXFP4,
     QuarkW4A4MXFp4MoE,
+    QuarkW4A8MXFp4MoE,
     QuarkW8A8Fp8,
     QuarkW8A8FP8MoE,
 )
@@ -275,6 +276,33 @@ class QuarkConfig(QuantizationConfig):
 
         return True
 
+    def _is_w4a8_mxfp4_fp8(
+        self,
+        weight_quant: Optional[dict[str, Any]],
+        input_quant: Optional[dict[str, Any]],
+    ) -> bool:
+        """MXFP4 weights (fp4, per_group, group_size=32, e8m0) with FP8 activations."""
+        if weight_quant is None or input_quant is None:
+            return False
+
+        # Weights must be fp4 with per-group e8m0 scales
+        if weight_quant.get("dtype") != "fp4":
+            return False
+        if weight_quant.get("qscheme") != "per_group":
+            return False
+        if weight_quant.get("group_size") != 32:
+            return False
+        if weight_quant.get("is_dynamic") is not False:
+            return False
+        if weight_quant.get("scale_format") != "e8m0":
+            return False
+
+        # Activations must be fp8_e4m3
+        if input_quant.get("dtype") != "fp8_e4m3":
+            return False
+
+        return True
+
     def _find_matched_config(
         self, layer_name: str, module: torch.nn.Module
     ) -> dict[str, Any]:
@@ -376,7 +404,9 @@ class QuarkConfig(QuantizationConfig):
         weight_config = layer_quant_config.get("weight")
         input_config = layer_quant_config.get("input_tensors")
 
-        if self._is_mx_fp4(weight_config, input_config):
+        if self._is_w4a8_mxfp4_fp8(weight_config, input_config):
+            return QuarkW4A8MXFp4MoE(weight_config, input_config)
+        elif self._is_mx_fp4(weight_config, input_config):
             return QuarkW4A4MXFp4MoE(weight_config, input_config)
         elif self._is_fp8_w8a8(weight_config, input_config):
             return QuarkW8A8FP8MoE(weight_config, input_config)
