@@ -29,7 +29,7 @@ _is_fp8_fnuz = is_fp8_fnuz()
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-if _use_aiter:
+if _is_hip:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
@@ -78,7 +78,7 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
 
         w13_up_dim, w2_down_dim, weight_padded = get_moe_weight_sizes(
             intermediate_size_per_partition,
-            is_aiter_moe=_use_aiter,
+            is_aiter_moe=_is_hip,
             is_concat=True,
             is_packed=True,
         )
@@ -205,27 +205,36 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
                         w2_input_scale, requires_grad=False
                     )
 
-        # Pre-shuffle e8m0 weight scales
-        s0, s1, _ = layer.w13_weight_scale.shape
-        w13_weight_scale = layer.w13_weight_scale.view(s0 * s1, -1)
-        w13_weight_scale = e8m0_shuffle(w13_weight_scale)
-        layer.w13_weight_scale.data = w13_weight_scale.view(s0, s1, -1)
+        # CK MoE kernels require hidden_size to be a multiple of 128.
+        # If not, skip shuffling and use the torch fallback path.
+        hidden_size = layer.w13_weight.shape[2] * 2
+        self._use_ck_moe = (hidden_size % 128 == 0)
 
-        s0, s1, _ = layer.w2_weight_scale.shape
-        w2_weight_scale = layer.w2_weight_scale.view(s0 * s1, -1)
-        w2_weight_scale = e8m0_shuffle(w2_weight_scale)
-        layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
+        if self._use_ck_moe:
+            s0, s1, _ = layer.w13_weight_scale.shape
+            w13_weight_scale = layer.w13_weight_scale.view(s0 * s1, -1)
+            w13_weight_scale = e8m0_shuffle(w13_weight_scale)
+            layer.w13_weight_scale.data = w13_weight_scale.view(s0, s1, -1)
 
-        # Pre-shuffle weights
-        if _is_shuffle_moe_mxfp4:
-            layer.w13_weight.data = shuffle_weight(
-                layer.w13_weight.contiguous(), (16, 16)
+            s0, s1, _ = layer.w2_weight_scale.shape
+            w2_weight_scale = layer.w2_weight_scale.view(s0 * s1, -1)
+            w2_weight_scale = e8m0_shuffle(w2_weight_scale)
+            layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
+
+            if _is_shuffle_moe_mxfp4:
+                layer.w13_weight.data = shuffle_weight(
+                    layer.w13_weight.contiguous(), (16, 16)
+                )
+                layer.w2_weight.data = shuffle_weight(
+                    layer.w2_weight.contiguous(), (16, 16)
+                )
+                layer.w13_weight.is_shuffled = True
+                layer.w2_weight.is_shuffled = True
+        else:
+            logger.info(
+                "hidden_size=%d not divisible by 128, using torch fallback MoE",
+                hidden_size,
             )
-            layer.w2_weight.data = shuffle_weight(
-                layer.w2_weight.contiguous(), (16, 16)
-            )
-            layer.w13_weight.is_shuffled = True
-            layer.w2_weight.is_shuffled = True
 
         if hasattr(layer, "dispatcher"):
             layer.dispatcher.set_quant_config({"weight_dtype": torch.float4_e2m1fn_x2})
@@ -256,27 +265,102 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
             w13_weight = layer.w13_weight
             w2_weight = layer.w2_weight
 
-        if hasattr(layer.w13_weight, "is_shuffled"):
-            w13_weight.is_shuffled = True
-            w2_weight.is_shuffled = True
+        if self._use_ck_moe:
+            if hasattr(layer.w13_weight, "is_shuffled"):
+                w13_weight.is_shuffled = True
+                w2_weight.is_shuffled = True
 
-        output = fused_moe(
-            x,
-            w13_weight,
-            w2_weight,
-            topk_weights,
-            topk_ids,
-            quant_type=QuantType.per_Token,
-            w1_scale=layer.w13_weight_scale,
-            w2_scale=layer.w2_weight_scale,
-            a1_scale=layer.w13_input_scale,
-            a2_scale=layer.w2_input_scale,
-            activation=(
-                ActivationType.Silu
-                if moe_runner_config.activation == "silu"
-                else ActivationType.Gelu
-            ),
-            doweight_stage1=False,
-            expert_mask=layer.dispatcher.expert_mask_gpu,
-        )
+            output = fused_moe(
+                x,
+                w13_weight,
+                w2_weight,
+                topk_weights,
+                topk_ids,
+                quant_type=QuantType.per_Token,
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                a1_scale=None,
+                a2_scale=None,
+                activation=(
+                    ActivationType.Silu
+                    if moe_runner_config.activation == "silu"
+                    else ActivationType.Gelu
+                ),
+                doweight_stage1=False,
+                expert_mask=layer.dispatcher.expert_mask_gpu,
+            )
+        else:
+            output = self._torch_fallback_moe(
+                x,
+                w13_weight,
+                w2_weight,
+                topk_weights,
+                topk_ids,
+                layer.w13_weight_scale,
+                layer.w2_weight_scale,
+                moe_runner_config.activation,
+            )
         return StandardCombineInput(hidden_states=output)
+
+    @staticmethod
+    def _dequant_mxfp4(w: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        """Dequantize MXFP4 weights with e8m0 block scales to bf16."""
+        from aiter.utility import fp4_utils
+
+        w_f = fp4_utils.mxfp4_to_f32(w)
+        s_f = fp4_utils.e8m0_to_f32(scale)
+        E, N, K_packed = w_f.shape
+        K_blocks = s_f.shape[2]
+        block_size = K_packed // K_blocks
+        w_f = w_f.view(E, N, K_blocks, block_size)
+        w_f = w_f * s_f.unsqueeze(-1)
+        return w_f.view(E, N, K_packed).to(torch.bfloat16)
+
+    @staticmethod
+    def _torch_fallback_moe(
+        x: torch.Tensor,
+        w13: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        w13_scale: torch.Tensor,
+        w2_scale: torch.Tensor,
+        activation: str,
+    ) -> torch.Tensor:
+        """Torch-native fallback for when CK GEMM dims are unsupported."""
+        if not hasattr(QuarkW4A8MXFp4MoE, "_fallback_debug_printed"):
+            QuarkW4A8MXFp4MoE._fallback_debug_printed = True
+            logger.info(
+                "Torch fallback MoE shapes: x=%s w13=%s w2=%s w13_scale=%s w2_scale=%s "
+                "topk_weights=%s topk_ids=%s",
+                x.shape, w13.shape, w2.shape, w13_scale.shape, w2_scale.shape,
+                topk_weights.shape, topk_ids.shape,
+            )
+        B, D = x.shape
+        topk = topk_ids.shape[1]
+        E = w13.shape[0]
+
+        w13_bf = QuarkW4A8MXFp4MoE._dequant_mxfp4(w13, w13_scale)
+        w2_bf = QuarkW4A8MXFp4MoE._dequant_mxfp4(w2, w2_scale)
+
+        x_bf = x.to(torch.bfloat16)
+        out = torch.zeros(B, D, dtype=torch.bfloat16, device=x.device)
+
+        for i in range(topk):
+            expert_ids = topk_ids[:, i]
+            weights = topk_weights[:, i]
+            for e_id in range(E):
+                mask = expert_ids == e_id
+                if not mask.any():
+                    continue
+                tokens = x_bf[mask]
+                h = tokens @ w13_bf[e_id].T
+                gate, up = h.split(h.shape[-1] // 2, dim=-1)
+                if activation == "silu":
+                    h = torch.nn.functional.silu(gate) * up
+                else:
+                    h = torch.nn.functional.gelu(gate) * up
+                h = h @ w2_bf[e_id].T
+                out[mask] += h * weights[mask].unsqueeze(-1).to(torch.bfloat16)
+
+        return out
