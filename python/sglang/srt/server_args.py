@@ -2224,6 +2224,13 @@ class ServerArgs:
                         "quantization format for GPT-OSS model, enabling "
                         "aiter MXFP4 MOE kernel."
                     )
+                    # NOTE: PR #27201 switches the AITER MXFP4 fused-MoE GPT-OSS
+                    # path from SEPARATED to INTERLEAVE gate/up tile layout
+                    # (the SEPARATED FlyDSL fp4x2 kernel was numerically broken
+                    # at TP>=2). The auto-set that previously forced SEPARATED
+                    # is intentionally left out so the global default
+                    # (INTERLEAVE) wins. Kept here as a historical breadcrumb:
+                    #     envs.SGLANG_USE_AITER_MOE_GU_ITLV.set(False)
                 elif is_hip() and envs.SGLANG_USE_AITER.get():
                     # For GPT-OSS bf16 on ROCm with aiter, use triton backend
                     # because aiter CK kernel doesn't support all GEMM dimensions
